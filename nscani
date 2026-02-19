@@ -1,0 +1,648 @@
+#!/usr/bin/env python3
+
+import socket
+import struct
+import re
+import time
+import random
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import platform
+import os
+import argparse
+import ipaddress
+
+
+
+# Evasion settings
+EVASION_MODE = {
+    "slow": {"delay": 1.0, "timeout": 6, "threads": 10},
+    "stealth": {"delay": 0.5, "timeout": 5, "threads": 50},
+    "normal": {"delay": 0.1, "timeout": 4, "threads": 100},
+    "fast": {"delay": 0, "timeout": 2, "threads": 200}
+}
+
+USE_FRAGMENTATION = False
+USE_DECOYS = False  # Set to True to enable decoy scanning
+NUM_DECOYS = 5      # Number of fake IPs to use
+
+COMMON_SERVICES = {
+    21: "ftp", 22: "ssh", 23: "telnet", 25: "smtp", 53: "dns",
+    80: "http", 110: "pop3", 139: "netbios", 143: "imap",
+    443: "https", 445: "smb", 3306: "mysql", 3389: "rdp",
+    5432: "postgresql", 6379: "redis", 8080: "http-proxy",
+    27017: "mongodb"
+}
+
+SERVICE_PROBES = {
+    80: b"GET / HTTP/1.1\r\nHost: target\r\n\r\n",
+    8080: b"GET / HTTP/1.1\r\nHost: target\r\n\r\n",
+    443: b"", 21: b"", 22: b"", 25: b"", 110: b"", 143: b"",
+}
+
+
+def check_root_privileges():
+    """
+    Check if script has root/administrator privileges.
+    Required for raw socket operations and decoy scanning.
+    """
+    if platform.system() == "Windows":
+        try:
+            import ctypes
+            return ctypes.windll.shell32.IsUserAnAdmin() != 0
+        except:
+            return False
+    else:  # Linux/Unix
+        return os.geteuid() == 0
+
+
+def generate_decoy_ips(target, num_decoys):
+    
+    
+    decoys = []
+    attempts = 0
+    
+    while len(decoys) < num_decoys and attempts < 100:
+        attempts += 1
+        # Generate only public IPs - avoid 192.168.x.x, 10.x.x.x, 172.16-31.x.x
+        ip = f"{random.randint(1,223)}.{random.randint(1,254)}.{random.randint(1,254)}.{random.randint(1,254)}"
+        try:
+            addr = ipaddress.ip_address(ip)
+            if not addr.is_private and not addr.is_loopback and not addr.is_reserved:
+                decoys.append(ip)
+        except:
+            continue
+    
+    return decoys
+    f 
+def ip_to_bytes(ip):
+    """Convert IP string to bytes for raw packet construction."""
+    return socket.inet_aton(ip)
+
+
+def calculate_checksum(data):
+    """
+    Calculate Internet Checksum (RFC 1071).
+    
+    Used for:
+    - IP header checksum
+    - TCP header checksum
+    
+    Algorithm:
+    1. Sum all 16-bit words
+    2. Add carry bits
+    3. Take one's complement
+    """
+    checksum = 0
+    # Handle odd-length data
+    data = data + b'\x00' if len(data) % 2 else data
+    
+    for i in range(0, len(data), 2):
+        word = (data[i] << 8) + data[i + 1]
+        checksum += word
+    
+    # Add carry
+    checksum = (checksum >> 16) + (checksum & 0xffff)
+    checksum += checksum >> 16
+    
+    return ~checksum & 0xffff
+
+
+def create_ip_header(source_ip, dest_ip, packet_length):
+    """
+    Create IPv4 header.
+    
+    IP Header Format (20 bytes):
+    - Version (4 bits) + Header Length (4 bits)
+    - Type of Service (1 byte)
+    - Total Length (2 bytes)
+    - Identification (2 bytes)
+    - Flags (3 bits) + Fragment Offset (13 bits)
+    - Time to Live (1 byte)
+    - Protocol (1 byte) - 6 for TCP
+    - Checksum (2 bytes)
+    - Source IP (4 bytes)
+    - Destination IP (4 bytes)
+    """
+    version_ihl = (4 << 4) + 5  # Version 4, Header length 5 (5 * 4 = 20 bytes)
+    tos = 0                      # Type of Service
+    total_length = packet_length # Will be filled by kernel on some systems
+    identification = random.randint(1, 65535)
+    flags_offset = 0             # No fragmentation
+    ttl = 64                     # Time to live
+    protocol = socket.IPPROTO_TCP  # TCP protocol
+    checksum = 0                 # Kernel will fill this
+    
+    ip_header = struct.pack(
+        '!BBHHHBBH4s4s',
+        version_ihl, tos, total_length, identification,
+        flags_offset, ttl, protocol, checksum,
+        ip_to_bytes(source_ip),
+        ip_to_bytes(dest_ip)
+    )
+    
+    return ip_header
+
+
+def create_tcp_header(source_ip, dest_ip, source_port, dest_port, seq=0, ack=0, flags=0x02):
+    """
+    Create TCP header.
+    
+    TCP Header Format (20 bytes minimum):
+    - Source Port (2 bytes)
+    - Destination Port (2 bytes)
+    - Sequence Number (4 bytes)
+    - Acknowledgment Number (4 bytes)
+    - Data Offset (4 bits) + Reserved (3 bits) + Flags (9 bits)
+    - Window Size (2 bytes)
+    - Checksum (2 bytes)
+    - Urgent Pointer (2 bytes)
+    
+    Flags:
+    - SYN (0x02) - Synchronize, used to initiate connection
+    - ACK (0x10) - Acknowledgment
+    - FIN (0x01) - Finish
+    - RST (0x04) - Reset
+    """
+    data_offset = 5  # 5 * 4 = 20 bytes (no options)
+    reserved = 0
+    
+    # TCP Flags (we use SYN by default for port scanning)
+    tcp_flags = flags  # 0x02 = SYN
+    
+    window = socket.htons(5840)  # Maximum window size
+    checksum = 0
+    urgent_ptr = 0
+    
+    # Pack TCP header without checksum
+    tcp_header = struct.pack(
+        '!HHLLBBHHH',
+        source_port,
+        dest_port,
+        seq,
+        ack,
+        (data_offset << 4) + reserved,
+        tcp_flags,
+        window,
+        checksum,
+        urgent_ptr
+    )
+    
+    # Create pseudo header for checksum calculation
+    pseudo_header = struct.pack(
+        '!4s4sBBH',
+        ip_to_bytes(source_ip),
+        ip_to_bytes(dest_ip),
+        0,  # Reserved
+        socket.IPPROTO_TCP,
+        len(tcp_header)
+    )
+    
+    # Calculate checksum
+    checksum = calculate_checksum(pseudo_header + tcp_header)
+    
+    # Repack with correct checksum
+    tcp_header = struct.pack(
+        '!HHLLBBH',
+        source_port,
+        dest_port,
+        seq,
+        ack,
+        (data_offset << 4) + reserved,
+        tcp_flags,
+        window
+    ) + struct.pack('H', checksum) + struct.pack('!H', urgent_ptr)
+    
+    return tcp_header
+
+
+def send_decoy_syn(target_ip, target_port, decoy_ip):
+    """
+    Send a SYN packet from a spoofed (decoy) IP address.
+    
+    This is the REAL decoy implementation using raw sockets.
+    
+    How it works:
+    1. Create raw socket (requires root/admin)
+    2. Craft IP header with spoofed source IP
+    3. Craft TCP header with SYN flag
+    4. Send raw packet
+    
+    What happens:
+    - Target sees SYN from decoy IP
+    - Target sends SYN-ACK to decoy IP (not to us!)
+    - Decoy IP (if real) will send RST (connection refused)
+    - If decoy IP is fake, packet goes nowhere
+    - Either way, target logs the decoy IP as scanner
+    
+    """
+    try:
+        # Create raw socket (requires root/admin privileges)
+        sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
+        
+        # Tell kernel we're providing IP header
+        sock.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
+        
+        # Random source port for the decoy
+        source_port = random.randint(1024, 65535)
+        
+        # Create headers
+        ip_header = create_ip_header(decoy_ip, target_ip, 40)  # 20 IP + 20 TCP
+        tcp_header = create_tcp_header(decoy_ip, target_ip, source_port, target_port)
+        
+        # Combine packet
+        packet = ip_header + tcp_header
+        
+        # Send the spoofed packet
+        sock.sendto(packet, (target_ip, target_port))
+        sock.close()
+        
+        return True
+        
+    except PermissionError:
+        print("[!] Error: Raw sockets require root/administrator privileges")
+        return False
+    except Exception as e:
+        print(f"[!] Decoy send error: {e}")
+        return False
+
+
+def scan_with_decoys(target, port, decoy_ips, config):
+    """
+    Perform a scan with decoy traffic.
+    
+    Process:
+    1. Send SYN packets from multiple decoy IPs
+    2. Send real scan from our IP
+    3. Mix timing randomly so real scan blends in
+    
+    Result:
+    - Target sees scans from multiple IPs
+    - IDS logs show multiple attackers
+    - Hard to identify which IP is real
+    """
+    # Randomly insert our real scan among decoys
+    all_ips = decoy_ips + ["REAL"]
+    random.shuffle(all_ips)
+    
+    real_result = None
+    
+    for ip in all_ips:
+        if ip == "REAL":
+            # Our actual scan
+            real_result = scan_single_port(target, port, config)
+        else:
+            # Send decoy SYN packet
+            send_decoy_syn(target, port, ip)
+        
+        # Small random delay between each packet
+        time.sleep(random.uniform(0.01, 0.05))
+    
+    return real_result
+
+
+def random_delay(base_delay, jitter=0.3):
+    """Add random jitter to delays."""
+    if base_delay == 0:
+        return 0
+    min_delay = base_delay * (1 - jitter)
+    max_delay = base_delay * (1 + jitter)
+    return random.uniform(min_delay, max_delay)
+
+
+def grab_banner(sock, port, timeout=2):
+    """Grab service banner."""
+    banner = ""
+    try:
+        sock.settimeout(timeout)
+        try:
+            data = sock.recv(1024)
+            banner = data.decode('utf-8', errors='ignore').strip()
+        except socket.timeout:
+            pass
+        except:
+            pass
+        
+        if not banner and port in SERVICE_PROBES:
+            probe = SERVICE_PROBES[port]
+            if probe:
+                sock.send(probe)
+                sock.settimeout(timeout)
+                data = sock.recv(1024)
+                banner = data.decode('utf-8', errors='ignore').strip()
+        
+        return banner[:200]
+    except Exception:
+        return ""
+
+
+def identify_service(port, banner):
+    """Identify service from banner."""
+    service_name = COMMON_SERVICES.get(port, "unknown")
+    version = "unknown"
+    
+    if not banner:
+        return service_name, version
+    
+    patterns = {
+        'ssh': r'SSH-([\d.]+)-OpenSSH[_\s]([\d.]+\w*)',
+        'ftp': r'220.*?(ProFTPD|vsftpd|FileZilla)[\s/]([\d.]+)',
+        'http': r'Server:\s*([^\r\n]+)',
+        'smtp': r'220.*?(Postfix|Exim|Sendmail)',
+        'mysql': r'([\d.]+)-MariaDB|MySQL',
+        'apache': r'Apache/([\d.]+)',
+        'nginx': r'nginx/([\d.]+)',
+    }
+    
+    for service_type, pattern in patterns.items():
+        match = re.search(pattern, banner, re.IGNORECASE)
+        if match:
+            service_name = service_type
+            if match.groups():
+                version = match.group(1)
+                if len(match.groups()) > 1 and match.group(2):
+                    version += " " + match.group(2)
+            break
+    
+    if version == "unknown" and banner:
+        first_line = banner.split('\n')[0].split('\r')[0]
+        if len(first_line) < 100:
+            version = first_line
+    
+    return service_name, version
+
+
+def scan_single_port(target, port, config):
+    if config['delay'] > 0:
+        time.sleep(random_delay(config['delay']))
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(config['timeout'])
+
+    if USE_FRAGMENTATION:
+        try:
+            sock.setsockopt(socket.IPPROTO_IP, socket.IP_MTU_DISCOVER, 0)
+        except:
+            pass
+
+    try:
+        result = sock.connect_ex((target, port))
+
+        if result == 0:
+            banner = grab_banner(sock, port, timeout=config['timeout'])
+            service, version = identify_service(port, banner)
+            return {
+                "port": port,
+                "state": "open",
+                "service": service,
+                "version": version,
+                "banner": banner[:100] if banner else ""
+            }
+        else:
+            return None
+
+    except socket.timeout:
+        return {
+            "port": port,
+            "state": "filtered",
+            "service": COMMON_SERVICES.get(port, "unknown"),  # ADDED
+            "version": "unknown",
+            "banner": ""
+        }
+    except Exception:
+        return None
+    finally:
+        sock.close()
+
+def randomize_port_order(start_port, end_port):
+    """Randomize port order."""
+    ports = list(range(start_port, end_port + 1))
+    random.shuffle(ports)
+    return ports
+
+
+def scan_ports(target, start_port=1, end_port=1024,
+               evasion_level="normal", randomize_order=True,
+               use_decoys=False, num_decoys=5, verbose=False):
+
+    config = EVASION_MODE.get(evasion_level, EVASION_MODE["normal"])
+    decoy_ips = []
+
+    if use_decoys:
+        if not check_root_privileges():
+            print("\n[!] WARNING: Decoy scanning requires root/administrator privileges!")
+            print("[!] Run with: sudo python3 script.py (Linux) or as Administrator (Windows)")
+            print("[!] Continuing without decoys...\n")
+            use_decoys = False
+        else:
+            decoy_ips = generate_decoy_ips(target, num_decoys)
+            print(f"[+] Root privileges detected - decoy scanning enabled!")
+
+    found_ports = []
+
+    print(f"\n{'='*70}")
+    print(f"[*] Advanced Stealth Port Scanner with Decoy Support")
+    print(f"{'='*70}")
+    print(f"[*] Target: {target}")
+    print(f"[*] Port Range: {start_port}-{end_port}")
+    print(f"[*] Evasion Level: {evasion_level.upper()}")
+    print(f"[*] Threads: {config['threads']}")
+    print(f"[*] Delay per port: {config['delay']}s (avg)")
+    print(f"[*] Timeout: {config['timeout']}s")
+    print(f"[*] Port Randomization: {'Enabled' if randomize_order else 'Disabled'}")
+    print(f"[*] Fragmentation: {'Enabled' if USE_FRAGMENTATION else 'Disabled'}")
+    print(f"[*] Decoy Scanning: {'Enabled' if use_decoys else 'Disabled'}")
+
+    if use_decoys:
+        print(f"\n[*] Decoy IPs ({len(decoy_ips)}):")
+        for i, decoy in enumerate(decoy_ips, 1):
+            print(f"    [{i}] {decoy}")
+        print(f"\n[*] Target will see scans from {len(decoy_ips) + 1} different IPs!")
+        print(f"[*] Your real IP will be mixed among decoys")
+
+    print(f"{'='*70}\n")
+
+    total_ports = end_port - start_port + 1
+    estimated_time = (total_ports * config['delay']) / config['threads']
+    if use_decoys:
+        estimated_time *= (num_decoys + 1) / 2
+
+    print(f"[*] Estimated scan time: ~{estimated_time:.1f} seconds")
+    print(f"[*] Starting scan...\n")
+
+    if randomize_order:
+        ports_to_scan = randomize_port_order(start_port, end_port)
+    else:
+        ports_to_scan = list(range(start_port, end_port + 1))
+
+    start_time = time.time()
+
+    with ThreadPoolExecutor(max_workers=config['threads']) as executor:
+        if use_decoys:
+            futures = [
+                executor.submit(scan_with_decoys, target, port, decoy_ips, config)
+                for port in ports_to_scan
+            ]
+        else:
+            futures = [
+                executor.submit(scan_single_port, target, port, config)
+                for port in ports_to_scan
+            ]
+
+        completed = 0
+        total = len(futures)
+
+        for future in as_completed(futures):
+            result = future.result()
+            completed += 1
+
+            if verbose and completed % 50 == 0:
+                elapsed = time.time() - start_time
+                progress = (completed / total) * 100
+                print(f"[*] Progress: {completed}/{total} ({progress:.1f}%) - Elapsed: {elapsed:.1f}s")
+
+            # CHANGED: collect open and filtered
+            if result and result["state"] in ("open", "filtered"):
+                found_ports.append(result)
+
+    elapsed_time = time.time() - start_time
+
+    open_ports     = [p for p in found_ports if p["state"] == "open"]
+    filtered_ports = [p for p in found_ports if p["state"] == "filtered"]
+
+    print(f"\n{'='*70}")
+    print(f"[*] Scan Complete")
+    print(f"[*] Total Time: {elapsed_time:.2f} seconds")
+    print(f"[*] Scan Rate: {total_ports/elapsed_time:.2f} ports/sec")
+    if use_decoys:
+        print(f"[*] Packets Sent: ~{total_ports * (num_decoys + 1)} (including decoys)")
+    print(f"{'='*70}")
+
+    # CHANGED: results table shows both open and filtered
+    if found_ports:
+        sorted_ports = sorted(found_ports, key=lambda x: x["port"])
+        print(f"\n{'='*70}")
+        print(f"  RESULTS — {len(open_ports)} open, {len(filtered_ports)} filtered on {target}")
+        print(f"{'='*70}")
+        print(f"  {'PORT':<12} {'STATE':<12} {'SERVICE':<20} VERSION")
+        print(f"  {'-'*60}")
+        for r in sorted_ports:
+            print(f"  {str(r['port'])+'/tcp':<12} {r['state']:<12} {r['service']:<20} {r['version']}")
+        print(f"{'='*70}\n")
+    else:
+        print(f"\n  [!] No open or filtered ports found in range {start_port}-{end_port}\n")
+
+   
+
+    return {
+        "target": target,
+        "scan_type": f"Stealth TCP Connect ({evasion_level})" + (" + Decoys" if use_decoys else ""),
+        "evasion_techniques": {
+            "rate_limiting": True,
+            "random_delays": True,
+            "port_randomization": randomize_order,
+            "fragmentation": USE_FRAGMENTATION,
+            "decoy_scanning": use_decoys,
+            "num_decoys": num_decoys if use_decoys else 0
+        },
+        "decoy_ips": decoy_ips if use_decoys else [],
+        "start_port": start_port,
+        "end_port": end_port,
+        "open_ports": sorted(open_ports, key=lambda x: x["port"]),
+        "filtered_ports": sorted(filtered_ports, key=lambda x: x["port"]),
+        "total_open_ports": len(open_ports),
+        "total_filtered_ports": len(filtered_ports),
+        "scan_duration": elapsed_time,
+        "scan_rate": total_ports / elapsed_time
+    }
+
+def print_usage():
+    """Display usage information."""
+    print("""
+╔════════════════════════════════════════════════════════════════════╗
+║           ADVANCED PORT SCANNER WITH DECOY CAPABILITIES            ║
+╚════════════════════════════════════════════════════════════════════╝
+
+DECOY SCANNING EXPLAINED:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Decoy scanning sends fake scan traffic from SPOOFED IP addresses along
+with your real scan. This makes it extremely difficult for IDS/IPS to
+identify which IP is the actual attacker.
+
+HOW IT WORKS:
+1. Script generates fake source IP addresses (decoys)
+2. Creates raw TCP SYN packets with spoofed source IPs
+3. Sends decoy packets to target
+4. Mixes your real scan among the decoy traffic
+5. Target sees scans from multiple IPs simultaneously
+
+WHAT THE TARGET SEES:
+Without Decoys:  [Your IP] → Target (obvious)
+With Decoys:     [Decoy1, Decoy2, Your IP, Decoy3, Decoy4] → Target
+                 (which one is real?)
+
+REQUIREMENTS FOR DECOY SCANNING:
+✓ Root/Administrator privileges (for raw sockets)
+✓ Direct network access (may not work through some firewalls)
+✓ Linux/Unix: sudo python3 scanner.py
+✓ Windows: Run as Administrator
+
+LIMITATIONS:
+⚠ Many ISPs filter spoofed packets (egress filtering)
+⚠ Works best on local networks or with complicit ISPs
+⚠ Target may still correlate timing patterns
+⚠ Some IDS can detect decoy patterns
+
+USAGE EXAMPLES:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Basic stealth scan (no decoys, no root needed)
+scan_ports("target.com", 1, 1000, evasion_level="stealth")
+
+# Stealth scan with 10 decoys (requires root)
+scan_ports("target.com", 1, 1000, 
+           evasion_level="stealth", 
+           use_decoys=True, 
+           num_decoys=10)
+
+# Maximum stealth (slow + decoys + randomization)
+scan_ports("target.com", 1, 1000,
+           evasion_level="slow",
+           use_decoys=True,
+           num_decoys=15,
+           randomize_order=True)
+
+
+
+""")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Port Scanner with Evasion")
+    parser.add_argument("target_ip", help="Target IP or hostname")
+    parser.add_argument("--start-port", type=int, default=1)
+    parser.add_argument("--end-port", type=int, default=100)
+    parser.add_argument("--evasion-level", default="stealth", choices=["stealth", "aggressive", "normal", "slow", "fast"])
+    parser.add_argument("--use-decoys", action="store_true")
+    parser.add_argument("--num-decoys", type=int, default=5)
+    parser.add_argument("--randomize-order", action="store_true")
+    parser.add_argument("--verbose", action="store_true")
+
+    args = parser.parse_args()
+
+    if check_root_privileges():
+        print("\n[+] Running with elevated privileges - all features available!")
+    else:
+        print("\n[!] Running without root/admin - decoy scanning disabled")
+        
+
+    results = scan_ports(
+        args.target_ip,
+        start_port=args.start_port,
+        end_port=args.end_port,
+        evasion_level=args.evasion_level,
+        use_decoys=args.use_decoys,
+        num_decoys=args.num_decoys,
+        randomize_order=args.randomize_order,
+        verbose=args.verbose
+    )
+
+    
